@@ -2,6 +2,7 @@
 package main
 
 import (
+	"log"
 	"os"
 	"strings"
 
@@ -35,7 +36,7 @@ func main() {
 				"fleetErrorMessage": err.Error(),
 			}).Fatal("Fleet cli failed")
 		} else {
-			logrus.Fatal(err)
+			log.Fatal(err)
 		}
 	}
 }
