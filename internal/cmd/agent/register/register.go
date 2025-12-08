@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/sirupsen/logrus"
 
 	"github.com/rancher/fleet/internal/config"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
 )
 
@@ -51,12 +53,14 @@ type AgentInfo struct {
 // For the initial registration, the fleet-agent-bootstrap secret must exist
 // on the local cluster.
 func Register(ctx context.Context, namespace string, config *rest.Config) (*AgentInfo, error) {
+	logger := log.FromContext(ctx).WithName("register-secret").WithValues("namespace", namespace)
+	ctx = log.IntoContext(ctx, logger)
 	for {
-		cfg, err := tryRegister(ctx, namespace, config)
+		cfg, err := tryRegister(ctx, namespace, config, logger)
 		if err == nil {
 			return cfg, nil
 		}
-		logrus.Errorf("Failed to register agent: %v", err)
+		logger.Error(err, "Failed to register agent")
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -67,7 +71,7 @@ func Register(ctx context.Context, namespace string, config *rest.Config) (*Agen
 
 // tryRegister makes sure the secret cattle-fleet-system/fleet-agent is
 // populated and the contained kubeconfig is working
-func tryRegister(ctx context.Context, namespace string, cfg *rest.Config) (*AgentInfo, error) {
+func tryRegister(ctx context.Context, namespace string, cfg *rest.Config, logger logr.Logger) (*AgentInfo, error) {
 	cfg = rest.CopyConfig(cfg)
 	// disable the rate limiter
 	cfg.QPS = -1
@@ -80,7 +84,7 @@ func tryRegister(ctx context.Context, namespace string, cfg *rest.Config) (*Agen
 
 	secret, err := k8s.Core().V1().Secret().Get(namespace, CredName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		logrus.Warn("Cannot find fleet-agent secret, running registration")
+		logger.Error(err, "Cannot find fleet-agent secret, running registration")
 		// fallback to local cattle-fleet-system/fleet-agent-bootstrap
 		secret, err = runRegistration(ctx, k8s.Core().V1(), namespace)
 		if err != nil {
@@ -90,7 +94,7 @@ func tryRegister(ctx context.Context, namespace string, cfg *rest.Config) (*Agen
 		return nil, err
 	} else if err := testClientConfig(secret.Data[Kubeconfig]); err != nil {
 		// skip testClientConfig check if previous error, or IsNotFound fallback succeeded
-		logrus.Errorf("Current credential failed, falling back to reregistering: %v", err)
+		logger.Error(err, "Current credential failed, falling back to reregistering")
 		secret, err = runRegistration(ctx, k8s.Core().V1(), namespace)
 		if err != nil {
 			return nil, fmt.Errorf("re-registration failed: %w", err)

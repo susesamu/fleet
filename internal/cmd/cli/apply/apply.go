@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"github.com/rancher/fleet/internal/bundlereader"
 	"github.com/rancher/fleet/internal/content"
 	"github.com/rancher/fleet/internal/fleetyaml"
@@ -40,6 +41,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var (
@@ -129,6 +131,8 @@ func getEffectiveMaxConcurrency(configured int) int {
 // repoName. Depending on opts.Output the bundles are created in the cluster or
 // printed to stdout, ...
 func CreateBundles(pctx context.Context, client client.Client, r record.EventRecorder, repoName string, baseDirs []string, opts Options) error {
+	logger := log.FromContext(pctx).WithName("create-bundles")
+	pctx = log.IntoContext(pctx, logger)
 	if len(baseDirs) == 0 {
 		baseDirs = []string{"."}
 	}
@@ -175,7 +179,7 @@ func CreateBundles(pctx context.Context, client client.Client, r record.EventRec
 						bundle, scans, err := bundleFromDir(ctx, repoName, path, opts)
 						if err != nil {
 							if errors.Is(err, ErrNoResources) {
-								logrus.Warnf("%s: %v", path, err)
+								logger.Error(err, path)
 								return nil
 							}
 							return err
@@ -227,7 +231,7 @@ func CreateBundles(pctx context.Context, client client.Client, r record.EventRec
 	egWrite.SetLimit(maxConcurrency)
 	for _, b := range bundlesToWrite {
 		egWrite.Go(func() error {
-			return writeBundle(ctx, client, r, b.bundle, b.scans, *b.opts)
+			return writeBundle(ctx, client, r, b.bundle, b.scans, *b.opts, logger)
 		})
 	}
 
@@ -244,6 +248,8 @@ func CreateBundles(pctx context.Context, client client.Client, r record.EventRec
 // If no fleet file is provided it tries to load a fleet.yaml in the root of the dir, or will consider
 // the directory as a raw content folder.
 func CreateBundlesDriven(pctx context.Context, client client.Client, r record.EventRecorder, repoName string, baseDirs []string, opts Options) error {
+	logger := log.FromContext(pctx).WithName("create-bundles-driven")
+	pctx = log.IntoContext(pctx, logger)
 	if len(baseDirs) == 0 {
 		baseDirs = []string{"."}
 	}
@@ -274,7 +280,7 @@ func CreateBundlesDriven(pctx context.Context, client client.Client, r record.Ev
 				bundle, scans, err := bundleFromDir(ctx, repoName, baseDir, opts)
 				if err != nil {
 					if errors.Is(err, ErrNoResources) {
-						logrus.Warnf("%s: %v", baseDir, err)
+						logger.Error(err, baseDir)
 						return nil
 					}
 					return err
@@ -321,7 +327,7 @@ func CreateBundlesDriven(pctx context.Context, client client.Client, r record.Ev
 	egWrite.SetLimit(maxConcurrency)
 	for _, b := range bundlesToWrite {
 		egWrite.Go(func() error {
-			return writeBundle(ctx, client, r, b.bundle, b.scans, *b.opts)
+			return writeBundle(ctx, client, r, b.bundle, b.scans, *b.opts, logger)
 		})
 	}
 
@@ -472,7 +478,7 @@ func bundleFromDir(ctx context.Context, name, baseDir string, opts Options) (*fl
 	return bundle, scans, nil
 }
 
-func writeBundle(ctx context.Context, c client.Client, r record.EventRecorder, bundle *fleet.Bundle, scans []*fleet.ImageScan, opts Options) error {
+func writeBundle(ctx context.Context, c client.Client, r record.EventRecorder, bundle *fleet.Bundle, scans []*fleet.ImageScan, opts Options, logger logr.Logger) error {
 	// Early return for "offline" mode, only printing the result to stdout/file
 	if opts.Output != nil {
 		return printToOutput(opts.Output, bundle, scans)
@@ -508,11 +514,11 @@ func writeBundle(ctx context.Context, c client.Client, r record.EventRecorder, b
 		return err
 	}
 	if useOCIRegistry {
-		if bundle, err = saveOCIBundle(ctx, c, r, bundle, ociOpts); err != nil {
+		if bundle, err = saveOCIBundle(ctx, c, r, bundle, ociOpts, logger); err != nil {
 			return err
 		}
 	} else {
-		if bundle, err = save(ctx, c, bundle); err != nil {
+		if bundle, err = save(ctx, c, bundle, logger); err != nil {
 			return err
 		}
 	}
@@ -591,7 +597,7 @@ func pushOCIManifest(ctx context.Context, bundle *fleet.Bundle, opts ocistorage.
 	return manifestID, nil
 }
 
-func save(ctx context.Context, c client.Client, bundle *fleet.Bundle) (*fleet.Bundle, error) {
+func save(ctx context.Context, c client.Client, bundle *fleet.Bundle, logger logr.Logger) (*fleet.Bundle, error) {
 	updated := bundle.DeepCopy()
 	result, err := controllerutil.CreateOrUpdate(ctx, c, bundle, func() error {
 		if bundle.Spec.HelmOpOptions != nil {
@@ -608,7 +614,7 @@ func save(ctx context.Context, c client.Client, bundle *fleet.Bundle) (*fleet.Bu
 			if err := deleteOCIManifest(ctx, c, bundle, ocistorage.OCIOpts{}); err != nil {
 				// we log the error and continue, since the OCI registry is an external entity to the the cluster
 				// we may encounter various types of transient errors (such as connection or access issues).
-				logrus.Warnf("deleting OCI artifact: %v", err)
+				logger.Error(err, "deleting OCI artifact")
 				return err
 
 			}
@@ -646,7 +652,7 @@ func saveImageScans(ctx context.Context, c client.Client, bundle *fleet.Bundle, 
 	return nil
 }
 
-func saveOCIBundle(ctx context.Context, c client.Client, r record.EventRecorder, bundle *fleet.Bundle, opts ocistorage.OCIOpts) (*fleet.Bundle, error) {
+func saveOCIBundle(ctx context.Context, c client.Client, r record.EventRecorder, bundle *fleet.Bundle, opts ocistorage.OCIOpts, logger logr.Logger) (*fleet.Bundle, error) {
 	manifestID, err := pushOCIManifest(ctx, bundle, opts)
 	if err != nil {
 		return bundle, err
@@ -669,8 +675,8 @@ func saveOCIBundle(ctx context.Context, c client.Client, r record.EventRecorder,
 			if err := deleteOCIManifest(ctx, c, bundle, opts); err != nil {
 				// we log the error and continue, since the OCI registry is an external entity to the the cluster
 				// we may encounter various types of transient errors (such as connection or access issues).
-				logrus.Warnf("deleting OCI artifact: %v", err)
-				sendWarningEvent(r, bundle.Namespace, bundle.Spec.ContentsID, err)
+				logger.Error(err, "deleting OCI artifact")
+				sendWarningEvent(r, bundle.Namespace, bundle.Spec.ContentsID, err, logger)
 			}
 		}
 
@@ -863,10 +869,10 @@ func deleteSecretIfExists(ctx context.Context, c client.Client, name, ns string)
 	return nil
 }
 
-func sendWarningEvent(r record.EventRecorder, namespace, artifactID string, errorToLog error) {
+func sendWarningEvent(r record.EventRecorder, namespace, artifactID string, errorToLog error, logger logr.Logger) {
 	jobName := os.Getenv(JobNameEnvVar)
 	if jobName == "" {
-		logrus.Warnf("%q environment variable not set", JobNameEnvVar)
+		logger.Error(nil, "%q environment variable not set", JobNameEnvVar)
 		return
 	}
 	job := &batchv1.Job{
